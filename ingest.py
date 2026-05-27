@@ -1,46 +1,83 @@
 import os
+import fitz
 import pickle
-from PyPDF2 import PdfReader
-from sentence_transformers import SentenceTransformer
 import faiss
 import numpy as np
+from sentence_transformers import SentenceTransformer
 
-PDF_DIR = "data/"
+DATA_DIR = "data/"
 VECTOR_DIR = "vectorstore/"
 
 os.makedirs(VECTOR_DIR, exist_ok=True)
 
 print("🔹 Loading embedding model...")
-embed_model = SentenceTransformer("all-MiniLM-L6-v2")
+model = SentenceTransformer("all-MiniLM-L6-v2")
 
-all_text = []
-for pdf_file in os.listdir(PDF_DIR):
-    if pdf_file.endswith(".pdf"):
-        reader = PdfReader(os.path.join(PDF_DIR, pdf_file))
-        for page in reader.pages:
-            all_text.append(page.extract_text())
 
-full_text = "\n".join(all_text)
+# ---------------- PDF READ ----------------
+def read_pdf(path):
+    try:
+        doc = fitz.open(path)
+        text = ""
 
-def split_text(text, chunk_size=500, overlap=50):
+        for page in doc:
+            text += page.get_text()
+
+        return text
+
+    except Exception:
+        print("⚠️ Skipping corrupted PDF:", path)
+        return ""
+
+
+# ---------------- CHUNK ----------------
+def chunk_text(text, size=500, overlap=50):
     chunks = []
     start = 0
+
     while start < len(text):
-        chunks.append(text[start:start + chunk_size])
-        start += chunk_size - overlap
+        chunks.append(text[start:start+size])
+        start += size - overlap
+
     return chunks
 
-chunks = split_text(full_text)
 
+# ---------------- LOAD FILES ----------------
+all_chunks = []
+
+for file in os.listdir(DATA_DIR):
+    if file.endswith(".pdf"):
+        path = os.path.join(DATA_DIR, file)
+        print("Processing:", file)
+
+        text = read_pdf(path)
+
+        if not text.strip():
+            continue
+
+        all_chunks.extend(chunk_text(text))
+
+
+# ---------------- SAFETY CHECK ----------------
+if len(all_chunks) == 0:
+    raise ValueError("❌ No valid text found in PDFs")
+
+
+# ---------------- EMBEDDINGS ----------------
 print("🔹 Creating embeddings...")
-embeddings = embed_model.encode(chunks).astype("float32")
+embeddings = model.encode(all_chunks).astype("float32")
 
-index = faiss.IndexFlatIP(embeddings.shape[1])
+# normalize
 faiss.normalize_L2(embeddings)
+
+# ---------------- FAISS ----------------
+index = faiss.IndexFlatIP(embeddings.shape[1])
 index.add(embeddings)
 
-faiss.write_index(index, f"{VECTOR_DIR}/index.faiss")
-with open(f"{VECTOR_DIR}/chunks.pkl", "wb") as f:
-    pickle.dump(chunks, f)
+# ---------------- SAVE ----------------
+faiss.write_index(index, VECTOR_DIR + "/index.faiss")
 
-print("✅ Vectorstore created successfully!")
+with open(VECTOR_DIR + "/chunks.pkl", "wb") as f:
+    pickle.dump(all_chunks, f)
+
+print("✅ Vector DB created successfully!")
