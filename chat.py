@@ -1,47 +1,180 @@
 import faiss
 import pickle
-import numpy as np
+import ollama
+
 from sentence_transformers import SentenceTransformer
 
 # ---------------- LOAD MODEL ----------------
-print("🔹 Loading model...")
-model = SentenceTransformer("all-MiniLM-L6-v2")
+
+print("🔹 Loading embedding model...")
+
+model = SentenceTransformer(
+    "all-MiniLM-L6-v2"
+)
 
 # ---------------- LOAD VECTOR DB ----------------
-index = faiss.read_index("vectorstore/index.faiss")
 
-with open("vectorstore/chunks.pkl", "rb") as f:
+print("🔹 Loading FAISS index...")
+
+index = faiss.read_index(
+    "vectorstore/index.faiss"
+)
+
+with open(
+    "vectorstore/chunks.pkl",
+    "rb"
+) as f:
     chunks = pickle.load(f)
 
-print("✅ Chatbot ready!\n")
+with open(
+    "vectorstore/metadata.pkl",
+    "rb"
+) as f:
+    metadata = pickle.load(f)
+
+print("✅ Chatbot Ready!\n")
+
 
 # ---------------- ASK FUNCTION ----------------
-def ask(query, top_k=3):
-    q_emb = model.encode([query]).astype("float32")
 
-    # normalize (important for cosine similarity)
-    faiss.normalize_L2(q_emb)
+def ask(query,
+        top_k=10,
+        threshold=0.30):
 
-    scores, idx = index.search(q_emb, top_k)
+    # QUERY EMBEDDING
 
-    results = []
-    for i in idx[0]:
-        if i < len(chunks):
-            results.append(chunks[i])
+    q_emb = model.encode(
+        [query]
+    ).astype("float32")
 
-    return "\n\n".join(results)
+    faiss.normalize_L2(
+        q_emb
+    )
+
+    # SEARCH
+
+    scores, indices = index.search(
+        q_emb,
+        top_k
+    )
+
+    retrieved_chunks = []
+    sources = []
+
+    # FILTER RESULTS
+
+    for score, idx in zip(
+        scores[0],
+        indices[0]
+    ):
+
+        if idx >= len(chunks):
+            continue
+
+        if score >= threshold:
+
+            retrieved_chunks.append(
+                chunks[idx]
+            )
+
+            if idx < len(metadata):
+
+                sources.append(
+                    metadata[idx]["source"]
+                )
+
+    # NO MATCH FOUND
+
+    if not retrieved_chunks:
+
+        return {
+            "answer":
+            "This information is not available in the PDF.",
+            "sources": []
+        }
+
+    # BEST CONTEXT
+
+    context = "\n\n".join(
+        retrieved_chunks[:3]
+    )
+
+    # PROMPT
+
+    prompt = f"""
+You are a strict PDF Question Answering Assistant.
+
+Rules:
+
+1. Answer ONLY from the provided context.
+2. Do NOT guess.
+3. Do NOT use outside knowledge.
+4. Keep answers concise.
+5. If answer is missing, reply exactly:
+This information is not available in the PDF.
+
+Context:
+{context}
+
+Question:
+{query}
+
+Answer:
+"""
+
+    # OLLAMA
+
+    response = ollama.chat(
+        model="tinyllama",
+        messages=[
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        options={
+            "temperature": 0
+        }
+    )
+
+    answer = response[
+        "message"
+    ]["content"]
+
+    return {
+        "answer": answer,
+        "sources": list(
+            set(sources)
+        )
+    }
 
 
 # ---------------- CHAT LOOP ----------------
+
 if __name__ == "__main__":
+
     while True:
-        query = input("\nAsk (type 'exit'): ")
+
+        query = input(
+            "\nAsk Question (type 'exit'): "
+        )
 
         if query.lower() == "exit":
-            print("Bye 👋")
+
+            print("\n👋 Goodbye")
             break
 
-        answer = ask(query)
+        result = ask(query)
 
         print("\n📌 Answer:\n")
-        print(answer)
+        print(result["answer"])
+
+        if result["sources"]:
+
+            print("\n📄 Sources:")
+
+            for source in result["sources"]:
+
+                print(
+                    f"- {source}"
+                )

@@ -1,38 +1,41 @@
 import streamlit as st
 import pickle
 import faiss
-import numpy as np
-import re
 import ollama
-from sentence_transformers import SentenceTransformer, CrossEncoder
+import re
+from sentence_transformers import SentenceTransformer
 
-VECTOR_DIR = "vectorstore/"
+VECTOR_DIR = "vectorstore"
 
-# ----------------------------
-# Load models & data
-# ----------------------------
+# ---------------------------
+# Load Models & Vector DB
+# ---------------------------
 @st.cache_resource
-def load_all():
-    st.info("🔹 Loading embedding model...")
+def load_data():
     embed_model = SentenceTransformer("all-MiniLM-L6-v2")
 
-    st.info("🔹 Loading re-ranker model...")
-    reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+    index = faiss.read_index(f"{VECTOR_DIR}/index.faiss")
 
-    st.info("🔹 Loading FAISS index...")
-    index = faiss.read_index(VECTOR_DIR + "index.faiss")
-
-    with open(VECTOR_DIR + "chunks.pkl", "rb") as f:
+    with open(f"{VECTOR_DIR}/chunks.pkl", "rb") as f:
         chunks = pickle.load(f)
 
-    return embed_model, reranker, index, chunks
+    with open(f"{VECTOR_DIR}/metadata.pkl", "rb") as f:
+        metadata = pickle.load(f)
+
+    return embed_model, index, chunks, metadata
 
 
-embed_model, reranker, index, chunks = load_all()
+embed_model, index, chunks, metadata = load_data()
 
-# ----------------------------
-# Highlight query words
-# ----------------------------
+# ---------------------------
+# Session State
+# ---------------------------
+if "history" not in st.session_state:
+    st.session_state.history = []
+
+# ---------------------------
+# Highlight Query
+# ---------------------------
 def highlight_query(text, query):
     for word in query.split():
         text = re.sub(
@@ -44,103 +47,160 @@ def highlight_query(text, query):
     return text
 
 
-# ----------------------------
-# Core QA logic (FAISS + RERANK)
-# ----------------------------
-def get_answer(query, faiss_k, rerank_threshold):
-    # ---- FAISS retrieval ----
+# ---------------------------
+# Answer Function
+# ---------------------------
+def get_answer(query, top_k=5):
+
     q_emb = embed_model.encode([query]).astype("float32")
-    distances, indices = index.search(q_emb, faiss_k)
 
-    retrieved_chunks = [chunks[i] for i in indices[0]]
+    faiss.normalize_L2(q_emb)
 
-    # ---- Re-ranking ----
-    pairs = [(query, chunk) for chunk in retrieved_chunks]
-    rerank_scores = reranker.predict(pairs)
+    scores, indices = index.search(q_emb, top_k)
 
-    # ---- Filter by threshold ----
-    final_chunks = []
-    debug_items = []
+    retrieved_chunks = []
+    sources = []
 
-    for chunk, score in zip(retrieved_chunks, rerank_scores):
-        debug_items.append((score, chunk))
-        if score >= rerank_threshold:
-            final_chunks.append(chunk)
+    for score, idx in zip(scores[0], indices[0]):
 
-    if not final_chunks:
+        if idx >= len(chunks):
+            continue
+
+        if score < 0.30:
+            continue
+
+        retrieved_chunks.append(chunks[idx])
+
+        if idx < len(metadata):
+            sources.append(metadata[idx]["source"])
+
+    if not retrieved_chunks:
         return (
-            "❌ This information is not available in the PDF.",
-            distances[0],
-            rerank_scores,
+            "This information is not available in the PDF.",
             [],
+            [],
+            scores[0],
         )
 
-    context = "\n\n".join(final_chunks)
+    context = "\n\n".join(retrieved_chunks[:3])
 
     prompt = f"""
-You must answer ONLY using the context below.
-If the answer is not present, say:
-"This information is not available in the PDF."
+Answer ONLY from the context below.
+
+Rules:
+1. Use only the context.
+2. Do not use outside knowledge.
+3. Do not guess.
+4. If answer is not found, reply:
+This information is not available in the PDF.
 
 Context:
 {context}
 
 Question:
 {query}
+
+Answer:
 """
 
-    response = ollama.chat(
-        model="tinyllama",
-        messages=[{"role": "user", "content": prompt}],
-        options={"temperature": 0.2},
-    )
+    try:
 
-    return response["message"]["content"], distances[0], rerank_scores, final_chunks
-
-
-# ----------------------------
-# Streamlit UI
-# ----------------------------
-st.title("📄 Local PDF Chatbot (FAISS + Re-Ranker + TinyLLaMA)")
-st.caption("Answers strictly from PDF content only")
-
-query = st.text_input("Ask a question from the PDF:")
-
-faiss_k = st.slider("FAISS Top-K Results", 3, 15, 8)
-
-rerank_threshold = st.slider(
-    "Re-ranker Threshold (higher = stricter)",
-    min_value=0.0,
-    max_value=10.0,
-    value=6.0,
-    step=0.1,
-)
-
-if st.button("Get Answer") and query:
-    with st.spinner("🔍 Retrieving, re-ranking & generating answer..."):
-        answer, faiss_dist, rerank_scores, matched_chunks = get_answer(
-            query, faiss_k, rerank_threshold
+        response = ollama.chat(
+            model="tinyllama",
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt,
+                }
+            ],
+            options={
+                "temperature": 0,
+            },
         )
 
-    # ---- Debug Info ----
-    st.subheader("🔍 Debug Info")
+        answer = response["message"]["content"]
 
-    st.write("FAISS Distances:")
-    st.write(faiss_dist)
+    except Exception as e:
 
-    st.write("Re-ranker scores (before threshold):")
-    st.write(rerank_scores)
+        answer = f"Ollama Error: {str(e)}"
 
-    st.subheader("Matched PDF Context:")
-    if matched_chunks:
+    return (
+        answer,
+        retrieved_chunks,
+        list(set(sources)),
+        scores[0],
+    )
+
+
+# ---------------------------
+# UI
+# ---------------------------
+st.set_page_config(
+    page_title="PDF RAG Assistant",
+    layout="wide",
+)
+
+st.title("📄 PDF Question Answering Assistant")
+
+st.caption("FAISS + TinyLlama + PDF Only Answers")
+
+# Sidebar
+st.sidebar.title("💬 Chat History")
+
+for item in st.session_state.history:
+    st.sidebar.write(f"Q: {item['question']}")
+    st.sidebar.write(f"A: {item['answer']}")
+    st.sidebar.divider()
+
+query = st.text_input(
+    "Ask a question from your PDF:"
+)
+
+top_k = st.slider(
+    "Top K Results",
+    min_value=1,
+    max_value=10,
+    value=5,
+)
+
+if st.button("Get Answer"):
+
+    if query.strip():
+
+        with st.spinner("Searching PDF..."):
+
+            answer, matched_chunks, sources, scores = get_answer(
+                query,
+                top_k,
+            )
+
+        st.session_state.history.append(
+            {
+                "question": query,
+                "answer": answer,
+            }
+        )
+
+        st.subheader("✅ Answer")
+        st.success(answer)
+
+        st.subheader("📄 Sources")
+
+        if sources:
+            for source in sources:
+                st.write("•", source)
+        else:
+            st.warning("No source found")
+
+        st.subheader("📚 Retrieved Context")
+
         for chunk in matched_chunks:
             st.markdown(
-                "- " + highlight_query(chunk, query),
+                highlight_query(chunk, query),
                 unsafe_allow_html=True,
             )
-    else:
-        st.warning("No chunks passed the re-ranker threshold.")
+            st.divider()
 
-    # ---- Final Answer ----
-    st.subheader("✅ Answer")
-    st.success(answer)
+        with st.expander("🔍 Debug Information"):
+            st.write("Similarity Scores")
+            st.write(scores)
